@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# ghostrunner — ephemeral GitHub Actions runner on demand.
+#
+# You have a workstation. It's faster than the box you normally host
+# CI runners on. When you're working, you want *this* box picking up
+# the jobs so you stop waiting on queue. When you're done, you want it
+# gone, no stale registration hanging around.
+#
+#   ghostrunner up [owner/repo]   — register + start this box as a runner
+#   ghostrunner down              — deregister + kill
+#   ghostrunner status            — running? busy? which job?
+#   ghostrunner logs              — tail the runner's log
+#
+# State lives in ~/.config/ghostrunner/<owner>--<repo>/. Token comes
+# from `gh auth token` — no separate PAT setup needed. If you need a
+# narrower PAT, set GHOSTRUNNER_TOKEN in the env.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+RUNNER_VERSION="2.328.0"
+CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/ghostrunner"
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/ghostrunner"
+RUNNER_DIR_NAME="actions-runner-${RUNNER_VERSION}"
+RUNNER_CACHE="${CACHE_ROOT}/${RUNNER_DIR_NAME}"
+
+die() { echo "ghostrunner: $*" >&2; exit 1; }
+log() { echo "ghostrunner: $*" >&2; }
+
+get_token() {
+    if [ -n "${GHOSTRUNNER_TOKEN:-}" ]; then
+        echo "$GHOSTRUNNER_TOKEN"
+    elif command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1; then
+        gh auth token
+    else
+        die "no token. set GHOSTRUNNER_TOKEN or run 'gh auth login'"
+    fi
+}
+
+detect_repo() {
+    # If called with explicit repo, use it. Else infer from current git repo.
+    if [ $# -ge 1 ] && [ -n "${1:-}" ]; then
+        echo "$1"
+        return
+    fi
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        local url
+        url=$(git remote get-url origin 2>/dev/null || true)
+        if [[ "$url" =~ github\.com[:/](.+/.+)(\.git)?$ ]]; then
+            echo "${BASH_REMATCH[1]%.git}"
+            return
+        fi
+    fi
+    die "no repo specified and cwd isn't a GitHub-origin git repo"
+}
+
+state_dir() {
+    local slug="${1//\//--}"
+    echo "${CONFIG_ROOT}/${slug}"
+}
+
+ensure_runner_binary() {
+    # Cache the runner tarball+extract across repos so each `up` is fast.
+    if [ -x "${RUNNER_CACHE}/run.sh" ]; then
+        return
+    fi
+    mkdir -p "$RUNNER_CACHE"
+    log "downloading actions-runner v${RUNNER_VERSION}"
+    local arch
+    case "$(uname -m)" in
+        x86_64) arch="x64" ;;
+        aarch64|arm64) arch="arm64" ;;
+        *) die "unsupported arch $(uname -m)" ;;
+    esac
+    local tarball="actions-runner-linux-${arch}-${RUNNER_VERSION}.tar.gz"
+    local url="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/${tarball}"
+    curl -fsSL "$url" -o "${RUNNER_CACHE}/${tarball}"
+    tar xzf "${RUNNER_CACHE}/${tarball}" -C "$RUNNER_CACHE"
+    rm -f "${RUNNER_CACHE}/${tarball}"
+}
+
+get_registration_token() {
+    local repo="$1" gh_token="$2"
+    curl -fsS \
+        -X POST \
+        -H "Authorization: Bearer ${gh_token}" \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "https://api.github.com/repos/${repo}/actions/runners/registration-token" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])"
+}
+
+get_remove_token() {
+    local repo="$1" gh_token="$2"
+    curl -fsS \
+        -X POST \
+        -H "Authorization: Bearer ${gh_token}" \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        "https://api.github.com/repos/${repo}/actions/runners/remove-token" \
+        | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])"
+}
+
+cmd_up() {
+    local repo="$1"
+    local gh_token
+    gh_token=$(get_token)
+
+    local state
+    state=$(state_dir "$repo")
+    if [ -f "${state}/pid" ] && kill -0 "$(cat "${state}/pid")" 2>/dev/null; then
+        die "already running for ${repo} (pid $(cat ${state}/pid))"
+    fi
+
+    ensure_runner_binary
+    mkdir -p "$state"
+
+    # Each `up` gets its own working dir so parallel `up` for different
+    # repos don't collide.
+    local work="${state}/work"
+    mkdir -p "$work"
+
+    # If the work dir already has a .runner file, we previously registered
+    # here. Clean it up to avoid "Runner already exists" errors.
+    if [ -f "${work}/.runner" ]; then
+        log "cleaning stale registration"
+        (cd "$work" && ./config.sh remove --token "$(get_remove_token "$repo" "$gh_token")" >/dev/null 2>&1 || true)
+    fi
+
+    local reg_token
+    reg_token=$(get_registration_token "$repo" "$gh_token")
+
+    local hostname
+    hostname=$(uname -n)
+    local runner_name="ghostrunner-${hostname}-$$"
+    local labels="ghostrunner,ghostrunner-${hostname},self-hosted,linux,x64"
+
+    log "registering ${runner_name} at ${repo}"
+
+    # Copy the cached runner layer into work so each repo has its own config
+    # (config.sh writes credentials into the runner dir).
+    cp -rT "$RUNNER_CACHE" "$work"
+
+    (
+        cd "$work"
+        ./config.sh \
+            --url "https://github.com/${repo}" \
+            --token "$reg_token" \
+            --name "$runner_name" \
+            --labels "$labels" \
+            --work "_work" \
+            --unattended \
+            --replace \
+            >/dev/null
+    )
+
+    log "starting runner"
+    (
+        cd "$work"
+        nohup ./run.sh >"${state}/runner.log" 2>&1 &
+        echo $! >"${state}/pid"
+    )
+
+    # Write metadata for status/down
+    {
+        echo "repo=${repo}"
+        echo "runner_name=${runner_name}"
+        echo "started_at=$(date -Iseconds)"
+    } >"${state}/meta"
+
+    sleep 1
+    local pid
+    pid=$(cat "${state}/pid")
+    if ! kill -0 "$pid" 2>/dev/null; then
+        die "runner failed to start. see ${state}/runner.log"
+    fi
+    log "up. pid=${pid} name=${runner_name}"
+    log "labels: ${labels}"
+    log "target workflows with: runs-on: [self-hosted, ghostrunner]"
+}
+
+cmd_down() {
+    local repo="$1"
+    local state
+    state=$(state_dir "$repo")
+
+    if [ ! -d "$state" ]; then
+        log "not registered for ${repo}"
+        return
+    fi
+
+    if [ -f "${state}/pid" ]; then
+        local pid
+        pid=$(cat "${state}/pid")
+        if kill -0 "$pid" 2>/dev/null; then
+            log "stopping runner (pid ${pid})"
+            kill "$pid" 2>/dev/null || true
+            # Give the runner up to 10s to shut down cleanly
+            for _ in 1 2 3 4 5 6 7 8 9 10; do
+                kill -0 "$pid" 2>/dev/null || break
+                sleep 1
+            done
+            kill -9 "$pid" 2>/dev/null || true
+        fi
+    fi
+
+    local work="${state}/work"
+    if [ -f "${work}/.runner" ]; then
+        log "deregistering"
+        local gh_token rm_token
+        gh_token=$(get_token)
+        rm_token=$(get_remove_token "$repo" "$gh_token" 2>/dev/null || true)
+        if [ -n "$rm_token" ]; then
+            (cd "$work" && ./config.sh remove --token "$rm_token" >/dev/null 2>&1 || true)
+        fi
+    fi
+
+    rm -rf "$state"
+    log "down."
+}
+
+cmd_status() {
+    if [ ! -d "$CONFIG_ROOT" ]; then
+        echo "no registrations"
+        return
+    fi
+    local any=false
+    for state in "$CONFIG_ROOT"/*/; do
+        [ -d "$state" ] || continue
+        any=true
+        local slug repo
+        slug=$(basename "$state")
+        repo="${slug//--//}"
+        local pid="(none)" alive="(down)"
+        if [ -f "${state}pid" ]; then
+            pid=$(cat "${state}pid")
+            if kill -0 "$pid" 2>/dev/null; then alive="running"; else alive="dead"; fi
+        fi
+        local started="(unknown)"
+        if [ -f "${state}meta" ]; then
+            started=$(grep "^started_at=" "${state}meta" | cut -d= -f2-)
+        fi
+        echo "${repo}: ${alive} pid=${pid} since=${started}"
+    done
+    [ "$any" = true ] || echo "no registrations"
+}
+
+cmd_logs() {
+    local repo="$1"
+    local state log
+    state=$(state_dir "$repo")
+    log="${state}/runner.log"
+    [ -f "$log" ] || die "no log for ${repo}"
+    tail -n "${LINES:-50}" "$log"
+}
+
+cmd_help() {
+    cat <<'EOF'
+ghostrunner — ephemeral GitHub Actions runner on demand
+
+  ghostrunner up [owner/repo]     register + start (defaults to origin)
+  ghostrunner down [owner/repo]   deregister + stop
+  ghostrunner status              list active registrations
+  ghostrunner logs [owner/repo]   tail runner diagnostic log
+  ghostrunner version             print version
+
+Workflows target this runner with:
+  jobs:
+    whatever:
+      runs-on: [self-hosted, ghostrunner]
+
+Runs as a plain foreground process, writes state under
+~/.config/ghostrunner/. Token from `gh auth token` or GHOSTRUNNER_TOKEN.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+    case "$cmd" in
+        up)
+            local repo; repo=$(detect_repo "${1:-}")
+            cmd_up "$repo"
+            ;;
+        down)
+            local repo; repo=$(detect_repo "${1:-}")
+            cmd_down "$repo"
+            ;;
+        status)
+            cmd_status
+            ;;
+        logs)
+            local repo; repo=$(detect_repo "${1:-}")
+            cmd_logs "$repo"
+            ;;
+        version|--version|-V)
+            echo "ghostrunner ${VERSION}"
+            ;;
+        help|--help|-h|"")
+            cmd_help
+            ;;
+        *)
+            die "unknown command: ${cmd}. try 'ghostrunner help'"
+            ;;
+    esac
+}
+
+main "$@"
