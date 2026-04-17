@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 RUNNER_VERSION="2.328.0"
 CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}/ghostrunner"
 CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/ghostrunner"
@@ -133,7 +133,21 @@ cmd_up() {
     local hostname
     hostname=$(uname -n)
     local runner_name="ghostrunner-${hostname}-$$"
-    local labels="ghostrunner,ghostrunner-${hostname},self-hosted,linux,x64"
+    # By default we advertise only the ghostrunner-specific labels. This
+    # prevents the runner from accidentally picking up jobs that happen
+    # to use `[self-hosted, linux, x64]` when the existing fleet has
+    # narrower expectations (e.g. a pre-built Python toolcache at
+    # /opt/hostedtoolcache that your workstation doesn't have).
+    #
+    # Workflows must opt in explicitly:
+    #
+    #   runs-on: [self-hosted, ghostrunner]
+    #
+    # If you want to broadcast the wider set, set GHOSTRUNNER_LABELS_WIDE=1.
+    local labels="ghostrunner,ghostrunner-${hostname}"
+    if [ -n "${GHOSTRUNNER_LABELS_WIDE:-}" ]; then
+        labels="${labels},self-hosted,linux,x64"
+    fi
 
     log "registering ${runner_name} at ${repo}"
 
